@@ -1,3 +1,4 @@
+[toc]
 # 保护模式
 
 ## 段寄存器介绍
@@ -169,8 +170,6 @@ int main()
 ```
 
 当时学从实模式到保护模式的时候，因为数据段只有一个ds去找的话比较繁琐，所以加了一个es段寄存器去找值
-
-RPL数值上要大于等于DPL，（权限小于DPL）才可以修改
 
 CPL：当前正在执行程序或任务的特权级，存放在代码段寄存器CS和堆栈段寄存器SS的最低两位中。
 
@@ -386,6 +385,313 @@ B = 0（64KB）
 **这里介绍了个指令：dg**
 
 ![image-20210322112359216](windows内核/image-20210322112359216.png)
+
+
+
+## 段权限检查
+
+火哥这里讲的没太懂，但是自己总结了一下
+
+![image-20210323103845641](windows内核/image-20210323103845641.png)
+
+这里火哥的图自己总结一下，首先指令mov ds,ax要检车cs代码段的cpl是否权限大于等于cs的dpl，如果大于dpl证明这句话可以执行，然后判断ds = ax，如果ds == ax啥也不做，但是如果数据段的rpl权限大于等于dpl，且cpl权限大于等于dpl，这样就可以访问数据区域，就可以赋值成功，刷新缓存
+
+总结权限：cpl（代码段） >= dpl（代码段）&& cpl（代码段） >= dpl （数据段）&& rpl （数据段）>= dpl（数据段）
+
+写一下R0层的和R3层的测试一下
+
+vs修改一下配置
+
+![image-20210323110458498](windows内核/image-20210323110458498.png)
+
+![image-20210323110513226](windows内核/image-20210323110513226.png)
+
+```c
+#include <ntddk.h>
+#include <ntstatus.h>
+
+
+VOID DriverUnload(PDRIVER_OBJECT pDriver)
+{
+	UNREFERENCED_PARAMETER(pDriver);
+	KdPrint(("驱动卸载\n"));
+}
+
+int g_value = 0;
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriver, PUNICODE_STRING pReg)
+{
+	UNREFERENCED_PARAMETER(pReg);
+	__asm
+	{
+		int 3;
+		mov ax, 0x4B;
+		mov ds, ax;
+		mov ebx, 0x64;
+		mov dword ptr ds : [g_value] , ebx;
+		mov ax, 0x20;
+		mov ds, ax;
+
+	}
+	KdPrint(("%X\n", g_value));
+	pDriver->DriverUnload = DriverUnload;
+	return STATUS_SUCCESS;
+}
+```
+
+![image-20210323111431405](windows内核/image-20210323111431405.png)
+
+如果我们把 mov ax, 0x4B; 我们构造成0x48，还构造成原来的段的样子就可以通过了不会蓝屏了
+
+![image-20210323112208912](windows内核/image-20210323112208912.png)
+
+测试cpl
+
+![image-20210323113619437](windows内核/image-20210323113619437.png)
+
+```
+r @寄存器 = 0 //就可以修改寄存器的值
+```
+
+
+
+## 跳转流程
+
+这节课主要介绍了跳转的流程和一致代码段好像没啥用 - -
+
+`JMP 0x20:0x12345678`流程：
+
+RPL >= DPL & CPL >= DPL （0x20的DPL）然后查找GDT表，CS = 0x20，代码段 base+0x12345678
+
+主要做实验来看一致代码段是否有用：
+
+因为书上说的是一致代码段可以R3去调用R0的函数，但是实际上这个中间要通过很多的过程并不是直接可以调用的
+
+```c
+#include <ntddk.h>
+
+
+VOID DriverUpload(PDRIVER_OBJECT pDriver)
+{
+	DbgPrint("upload sucessful!\n");
+}
+
+
+__declspec(naked) void test()
+{
+	__asm
+	{
+		int 3;
+		ret;
+	}
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriver, PUNICODE_STRING pReg)
+{
+	DbgPrint("welcome!\n");
+	DbgPrint("%x\n", test);
+	return STATUS_SUCCESS;
+}
+```
+
+我们构建一致代码段，看是否在r3 可否调用0环的代码
+
+![image-20210323151153970](windows内核/image-20210323151153970.png)
+
+![image-20210323151557951](windows内核/image-20210323151557951.png)
+
+![image-20210323151708765](windows内核/image-20210323151708765.png)
+
+发现并不可以
+
+![image-20210323151740670](windows内核/image-20210323151740670.png)
+
+一般分页模式后三位都是0的情况下是 10 10 12 分页 不是0的情况下是 2 9 9 12分页
+
+![image-20210323153355606](windows内核/image-20210323153355606.png)
+
+地址是f78de040
+
+```
+0xf78de040
+11				3*8
+1 1011 1100		1BC * 8			
+0 1101 1110		DE * 8
+0000 0100 0000	40
+```
+
+看一下PDPTE PDE PTE 物理页
+
+![image-20210323154116309](windows内核/image-20210323154116309.png)
+
+修改完：
+
+![image-20210324110227704](windows内核/image-20210324110227704.png)
+
+这里发现了个问题！群里问了一下！
+
+![image-20210323161126524](windows内核/image-20210323161126524.png)
+
+![image-20210323161141214](windows内核/image-20210323161141214.png)
+
+小路哥哥这边说是cow机制，CopyOnWrite，写时复制
+
+改了内存属性，系统会在你修改内存的时候，帮你复制然后拷贝一个新的物理页面出来，那时候pte的内容就不一样了
+
+测试：
+
+```c
+// 1234.cpp : Defines the entry point for the console application.
+//
+
+#include "stdafx.h"
+
+int var = 0;
+
+int main(int argc, char* argv[])
+{
+	__asm
+	{
+		mov ax,0x48;
+		mov ds,ax;
+		mov ebx , 0x68;
+		mov dword ptr ds:[var],ebx;
+	}
+	printf("%x\n",var);
+	return 0;
+}
+
+```
+
+`!vtop cr3 va`
+
+![img](windows内核/BX33]]29%WP6I26NS3Z5RV4.png)
+
+发触发了写时复制的情况
+
+![image-20210323170116270](windows内核/image-20210323170116270.png)
+
+
+
+## 段跳转实验-一致代码段分析
+
+这里主要是实验了 一致代码段的问题，这里设置成一致代码段的条件之外，还需要把PDE，PTE的权限U/S改成1，这样就可以在r3层去访问r0的函数代码
+
+实验代码：
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+
+int gupdate_value = 0;
+int main(int argc,char * argv[])
+{
+	char buf[]={0x0,0,0,0,0x90,0};
+	unsigned int value = 0;
+	*((unsigned int *) &buf[0])=0xF8AD1060;
+	printf("%X\n",&gupdate_value);
+	system("pause");
+	__asm
+	{
+		mov eax,0xF8AD1060;
+		mov eax,[eax];
+		mov value,eax;
+		call fword ptr ds:[buf]
+	}
+	printf("%X\n",gupdate_value);
+	printf("%X\n",value);
+	system("pause");
+	return 0;
+}
+
+```
+
+```c
+#include <ntddk.h>
+
+VOID DriverUpload(PDRIVER_OBJECT pDriver)
+{
+	KdPrint(("卸载完成\n"));
+}
+
+int g_value = 10;
+
+void  __declspec(naked) test()
+{
+	__asm
+	{
+		int 3;
+		mov eax, 0x429C78; 
+		mov ebx, 0x100;
+		mov [eax], ebx;
+		
+		retf;
+
+	}
+	
+	
+	
+}
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriver, PUNICODE_STRING pReg)
+{
+	KdPrint(("welcome to driver world\n"));
+	KdPrint(("%X\n", test));
+	pDriver->DriverUnload = DriverUpload;
+	return STATUS_SUCCESS;
+}
+```
+
+![image-20210324135640141](windows内核/image-20210324135640141.png)
+
+![image-20210324135621607](windows内核/image-20210324135621607.png)
+
+
+
+## 长调用与短调用
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
